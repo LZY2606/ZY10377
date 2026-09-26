@@ -1,0 +1,677 @@
+use alloc::collections::BTreeSet;
+
+use proc_macro2::TokenStream;
+use quote::{ToTokens, quote};
+use syn::Generics;
+
+use crate::common::{
+    generate::generics::{SplitGenerics, add_bound_to_all_type_params},
+    models::{
+        ConditionalDeriveGroup, ErrorTypePath, InnerType, ParseErrorTypeName, SerdeCustomization,
+        TypeName,
+    },
+};
+
+use super::parse_error::{gen_def_parse_error, gen_parse_error_name};
+
+/// Generated implementation of traits.
+pub struct GeneratedTraits {
+    /// Transparent traits that are simply derived.
+    pub derive_transparent_traits: TokenStream,
+
+    /// Implementation of traits.
+    pub implement_traits: TokenStream,
+
+    /// Conditional `#[cfg_attr(pred, derive(...))]` attributes.
+    pub conditional_derive_transparent_traits: TokenStream,
+
+    /// Conditional `#[cfg(pred)] impl ...` blocks.
+    pub conditional_implement_traits: TokenStream,
+
+    /// (predicate, ParseErrorTypeName) pairs for conditional `FromStr` re-exports.
+    pub conditional_from_str_parse_errors: Vec<(TokenStream, ParseErrorTypeName)>,
+}
+
+/// Split traits into 2 groups for generation:
+/// * Transparent traits can be simply derived, e.g. `derive(Debug)`.
+/// * Irregular traits requires custom implementation to be generated.
+pub enum GeneratableTrait<TransparentTrait, IrregularTrait> {
+    Transparent(TransparentTrait),
+    Irregular(IrregularTrait),
+}
+
+pub struct GeneratableTraits<TransparentTrait, IrregularTrait> {
+    pub transparent_traits: Vec<TransparentTrait>,
+    pub irregular_traits: Vec<IrregularTrait>,
+}
+
+pub fn split_into_generatable_traits<InputTrait, TransparentTrait, IrregularTrait>(
+    input_traits: BTreeSet<InputTrait>,
+) -> GeneratableTraits<TransparentTrait, IrregularTrait>
+where
+    GeneratableTrait<TransparentTrait, IrregularTrait>: From<InputTrait>,
+{
+    let mut transparent_traits: Vec<TransparentTrait> = Vec::with_capacity(24);
+    let mut irregular_traits: Vec<IrregularTrait> = Vec::with_capacity(24);
+
+    for input_trait in input_traits {
+        match GeneratableTrait::from(input_trait) {
+            GeneratableTrait::Transparent(st) => transparent_traits.push(st),
+            GeneratableTrait::Irregular(it) => irregular_traits.push(it),
+        };
+    }
+
+    GeneratableTraits {
+        transparent_traits,
+        irregular_traits,
+    }
+}
+
+/// Output of processing conditional derives.
+pub struct ConditionalTraits {
+    pub derive_transparent_traits: TokenStream,
+    pub implement_traits: TokenStream,
+    pub from_str_parse_errors: Vec<(TokenStream, ParseErrorTypeName)>,
+}
+
+/// Indicates whether an irregular trait variant generates a `ParseError` type definition
+/// that must be re-exported at module level when used inside conditional derives.
+///
+/// For non-string types (integer, float, any), `FromStr` generates a `ParseError` enum
+/// (via `gen_impl_trait_from_str` -> `gen_def_parse_error`). When such a trait appears
+/// inside a conditional derive group, the generated code must use a `mod` wrapper
+/// instead of `const _: () = { ... }`, so that `ParseError` is accessible for re-export.
+///
+/// String's `FromStr` does **not** generate a `ParseError` type -- it reuses the
+/// validation error type directly -- so it returns `false` for all variants.
+pub trait HasGeneratedParseError {
+    /// Returns `true` if this irregular trait variant generates a `ParseError` type
+    /// definition that needs module-level re-export in conditional derives.
+    fn has_generated_parse_error(&self) -> bool;
+}
+
+/// Process conditional derive groups, splitting each into transparent and irregular traits,
+/// and generating the appropriate `#[cfg_attr(...)]` / `#[cfg(...)]` wrappers.
+///
+/// This is shared logic used by all type-specific `gen_traits` functions.
+///
+/// For each conditional group:
+/// 1. Transparent traits + unchecked traits -> `#[cfg_attr(pred, derive(...))]`
+/// 2. Irregular traits -> wrapped in either:
+///    - `mod __fromstr_impl__ { ... }` + `pub use ...` if any trait
+///      [`has_generated_parse_error`](HasGeneratedParseError::has_generated_parse_error),
+///      so the `ParseError` type is accessible for re-export.
+///    - `const _: () = { ... };` otherwise.
+pub fn process_conditional_derives<InputTrait, TransparentTrait, IrregularTrait>(
+    conditional_derives: &[ConditionalDeriveGroup<InputTrait>],
+    type_name: &TypeName,
+    gen_impl_traits: impl Fn(Vec<IrregularTrait>) -> Result<TokenStream, syn::Error>,
+) -> Result<ConditionalTraits, syn::Error>
+where
+    InputTrait: Ord + Clone,
+    TransparentTrait: ToTokens,
+    IrregularTrait: HasGeneratedParseError,
+    GeneratableTrait<TransparentTrait, IrregularTrait>: From<InputTrait>,
+{
+    let mut derive_transparent_traits = TokenStream::new();
+    let mut implement_traits = TokenStream::new();
+    let mut from_str_parse_errors: Vec<(TokenStream, ParseErrorTypeName)> = vec![];
+
+    for group in conditional_derives {
+        let pred = &group.predicate;
+
+        let cond_traits: BTreeSet<InputTrait> = group.typed_traits.iter().cloned().collect();
+        let GeneratableTraits {
+            transparent_traits: cond_transparent,
+            irregular_traits: cond_irregular,
+        } = split_into_generatable_traits(cond_traits);
+
+        let cond_unchecked = &group.unchecked_traits;
+        if !cond_transparent.is_empty() || !cond_unchecked.is_empty() {
+            derive_transparent_traits.extend(quote! {
+                #[cfg_attr(#pred, derive(
+                    #(#cond_transparent,)*
+                    #(#cond_unchecked,)*
+                ))]
+            });
+        }
+
+        if !cond_irregular.is_empty() {
+            let needs_parse_error_reexport = cond_irregular
+                .iter()
+                .any(HasGeneratedParseError::has_generated_parse_error);
+
+            let impl_tokens = gen_impl_traits(cond_irregular)?;
+
+            if needs_parse_error_reexport {
+                // When FromStr is conditional, use a module wrapper so ParseError
+                // is accessible for re-export (not trapped inside const block).
+                let fromstr_mod_name = quote::format_ident!("__fromstr_impl__");
+                let parse_error_name = gen_parse_error_name(type_name);
+                implement_traits.extend(quote! {
+                    #[cfg(#pred)]
+                    mod #fromstr_mod_name {
+                        use super::*;
+                        #impl_tokens
+                    }
+                    #[cfg(#pred)]
+                    pub use #fromstr_mod_name::#parse_error_name;
+                });
+                from_str_parse_errors.push((pred.clone(), parse_error_name));
+            } else {
+                implement_traits.extend(quote! {
+                    #[cfg(#pred)]
+                    const _: () = {
+                        #impl_tokens
+                    };
+                });
+            }
+        }
+    }
+
+    Ok(ConditionalTraits {
+        derive_transparent_traits,
+        implement_traits,
+        from_str_parse_errors,
+    })
+}
+
+pub fn gen_impl_trait_into(
+    type_name: &TypeName,
+    generics: &Generics,
+    inner_type: impl Into<InnerType>,
+) -> TokenStream {
+    let inner_type: InnerType = inner_type.into();
+    let SplitGenerics {
+        impl_generics,
+        type_generics,
+        where_clause,
+    } = SplitGenerics::new(generics);
+
+    // NOTE: We're getting blank implementation of
+    //     Into<Inner> for Type
+    // by implementing
+    //     From<Type> for Inner
+    quote! {
+        impl #impl_generics ::core::convert::From<#type_name #type_generics> for #inner_type #where_clause {
+            #[inline]
+            fn from(value: #type_name #type_generics) -> Self {
+                value.into_inner()
+            }
+        }
+    }
+}
+
+pub fn gen_impl_trait_as_ref(
+    type_name: &TypeName,
+    generics: &Generics,
+    inner_type: impl ToTokens,
+) -> TokenStream {
+    let SplitGenerics {
+        impl_generics,
+        type_generics,
+        where_clause,
+    } = SplitGenerics::new(generics);
+
+    // Example for `struct Collection<T: Ord>(Vec<T>) where T: Clone`:
+    //
+    // impl<T: Ord> AsRef<Vec<T>> for Collection<T> where T: Clone {
+    //     #[inline]
+    //     fn as_ref(&self) -> &Vec<T> {
+    //         &self.0
+    //     }
+    // }
+    quote! {
+        impl #impl_generics ::core::convert::AsRef<#inner_type> for #type_name #type_generics #where_clause {
+            #[inline]
+            fn as_ref(&self) -> &#inner_type {
+                &self.0
+            }
+        }
+    }
+}
+
+pub fn gen_impl_trait_deref(
+    type_name: &TypeName,
+    generics: &Generics,
+    inner_type: impl ToTokens,
+) -> TokenStream {
+    let SplitGenerics {
+        impl_generics,
+        type_generics,
+        where_clause,
+    } = SplitGenerics::new(generics);
+
+    quote! {
+        impl #impl_generics ::core::ops::Deref for #type_name #type_generics #where_clause {
+            type Target = #inner_type;
+
+            #[inline]
+            fn deref(&self) -> &Self::Target {
+                &self.0
+            }
+        }
+    }
+}
+
+pub fn gen_impl_trait_display(type_name: &TypeName, generics: &Generics) -> TokenStream {
+    let generics_with_display_bound =
+        add_bound_to_all_type_params(generics, syn::parse_quote!(::core::fmt::Display));
+    let SplitGenerics {
+        impl_generics,
+        type_generics,
+        where_clause,
+    } = SplitGenerics::new(&generics_with_display_bound);
+
+    quote! {
+        impl #impl_generics ::core::fmt::Display for #type_name #type_generics #where_clause {
+            #[inline]
+            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                // A tiny wrapper function with trait boundary that improves error reporting.
+                // It makes it clear for the end-user that the inner type has to implement Display
+                // in order to derive display for the newtype.
+                #[inline]
+                fn display<T: ::core::fmt::Display>(f: &mut ::core::fmt::Formatter<'_>, val: &T) -> ::core::fmt::Result {
+                    use ::core::fmt::Display;
+                    val.fmt(f)
+                }
+                display(f, &self.0)
+            }
+        }
+    }
+}
+
+pub fn gen_impl_trait_borrow(
+    type_name: &TypeName,
+    generics: &Generics,
+    borrowed_type: impl ToTokens,
+) -> TokenStream {
+    let SplitGenerics {
+        impl_generics,
+        type_generics,
+        where_clause,
+    } = SplitGenerics::new(generics);
+
+    quote! {
+        impl #impl_generics ::core::borrow::Borrow<#borrowed_type> for #type_name #type_generics #where_clause {
+            #[inline]
+            fn borrow(&self) -> &#borrowed_type {
+                &self.0
+            }
+        }
+    }
+}
+
+pub fn gen_impl_trait_from(
+    type_name: &TypeName,
+    generics: &Generics,
+    inner_type: impl ToTokens,
+) -> TokenStream {
+    let SplitGenerics {
+        impl_generics,
+        type_generics,
+        where_clause,
+    } = SplitGenerics::new(generics);
+
+    quote! {
+        impl #impl_generics ::core::convert::From<#inner_type> for #type_name #type_generics #where_clause {
+            #[inline]
+            fn from(raw_value: #inner_type) -> Self {
+                Self::new(raw_value)
+            }
+        }
+    }
+}
+
+pub fn gen_impl_trait_try_from(
+    type_name: &TypeName,
+    generics: &Generics,
+    inner_type: impl ToTokens,
+    maybe_error_type_name: Option<&ErrorTypePath>,
+) -> TokenStream {
+    let SplitGenerics {
+        impl_generics,
+        type_generics,
+        where_clause,
+    } = SplitGenerics::new(generics);
+
+    match maybe_error_type_name {
+        Some(error_type_name) => {
+            // The case when there are validation
+            quote! {
+                impl #impl_generics ::core::convert::TryFrom<#inner_type> for #type_name #type_generics #where_clause {
+                    type Error = #error_type_name;
+
+                    #[inline]
+                    fn try_from(raw_value: #inner_type) -> ::core::result::Result<#type_name #type_generics, Self::Error> {
+                        Self::try_new(raw_value)
+                    }
+                }
+            }
+        }
+        None => {
+            // The case when there are no validation
+            quote! {
+                impl #impl_generics ::core::convert::TryFrom<#inner_type> for #type_name #type_generics #where_clause {
+                    type Error = ::core::convert::Infallible;
+
+                    #[inline]
+                    fn try_from(raw_value: #inner_type) -> ::core::result::Result<#type_name #type_generics, Self::Error> {
+                        Ok(Self::new(raw_value))
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Generate implementation of FromStr trait for non-string types (e.g. integers or floats).
+pub fn gen_impl_trait_from_str(
+    type_name: &TypeName,
+    generics: &Generics,
+    inner_type: impl Into<InnerType>,
+    maybe_error_type_name: Option<&ErrorTypePath>,
+) -> TokenStream {
+    let inner_type: InnerType = inner_type.into();
+    let parse_error_type_name = gen_parse_error_name(type_name);
+    let def_parse_error = gen_def_parse_error(
+        type_name,
+        generics,
+        inner_type.clone(),
+        maybe_error_type_name,
+        &parse_error_type_name,
+    );
+
+    let generics_with_fromstr_bound = add_bound_to_all_type_params(
+        generics,
+        syn::parse_quote!(::core::str::FromStr<Err: ::core::fmt::Debug>),
+    );
+    let SplitGenerics {
+        impl_generics,
+        type_generics,
+        where_clause,
+    } = SplitGenerics::new(&generics_with_fromstr_bound);
+
+    if let Some(_error_type_name) = maybe_error_type_name {
+        // The case with validation
+        quote! {
+            #def_parse_error
+
+            impl #impl_generics ::core::str::FromStr for #type_name #type_generics #where_clause {
+                type Err = #parse_error_type_name #type_generics;
+
+                fn from_str(raw_string: &str) -> ::core::result::Result<Self, Self::Err> {
+                    let raw_value: #inner_type = raw_string.parse().map_err(#parse_error_type_name::Parse)?;
+                    Self::try_new(raw_value).map_err(#parse_error_type_name::Validate)
+                }
+            }
+        }
+    } else {
+        // The case without validation
+        quote! {
+            #def_parse_error
+
+            impl #impl_generics ::core::str::FromStr for #type_name #type_generics #where_clause {
+                type Err = #parse_error_type_name #type_generics;
+
+                fn from_str(raw_string: &str) -> ::core::result::Result<Self, Self::Err> {
+                    let value: #inner_type = raw_string.parse().map_err(#parse_error_type_name::Parse)?;
+                    Ok(#type_name::new(value))
+                }
+            }
+        }
+    }
+}
+
+pub fn gen_impl_trait_serde_serialize(
+    type_name: &TypeName,
+    generics: &Generics,
+    inner_type: impl Into<InnerType>,
+    serde_customization: &SerdeCustomization,
+) -> TokenStream {
+    let inner_type: InnerType = inner_type.into();
+
+    // Turn `<T>` into `<T: Serialize>`
+    let all_generics_with_serialize_bound =
+        add_bound_to_all_type_params(generics, syn::parse_quote!(::serde::Serialize));
+    let SplitGenerics {
+        impl_generics,
+        type_generics,
+        where_clause,
+    } = SplitGenerics::new(&all_generics_with_serialize_bound);
+
+    let type_name_str = type_name.to_string();
+    let maybe_serialize_with = serde_customization.effective_serialize_with();
+
+    let body = match (serde_customization.is_transparent(), maybe_serialize_with) {
+        // Plain newtype framing (the default serde derive behavior).
+        (false, None) => quote! {
+            ::serde::ser::Serializer::serialize_newtype_struct(serializer, #type_name_str, &self.0)
+        },
+        // Transparent: serialize exactly as the inner value.
+        (true, None) => quote! {
+            ::serde::Serialize::serialize(&self.0, serializer)
+        },
+        // Transparent + custom function: the function gets the serializer directly.
+        (true, Some(serialize_with)) => quote! {
+            #serialize_with(&self.0, serializer)
+        },
+        // Newtype framing + custom function: mirror serde's own derive, which
+        // wraps the field in a private struct whose Serialize impl calls the
+        // custom function. This keeps the framing identical to a plain struct
+        // using `#[serde(serialize_with = ...)]`.
+        (false, Some(serialize_with)) => {
+            // The wrapper needs the type generics (the inner type may use them)
+            // plus a lifetime for the borrowed inner value.
+            let mut wrapper_generics = all_generics_with_serialize_bound.clone();
+            wrapper_generics
+                .params
+                .push(syn::parse_quote!('__nutype_sw));
+            let SplitGenerics {
+                impl_generics: wrapper_impl_generics,
+                type_generics: wrapper_type_generics,
+                where_clause: wrapper_where_clause,
+            } = SplitGenerics::new(&wrapper_generics);
+
+            quote! {
+                struct __SerializeWith #wrapper_impl_generics #wrapper_where_clause {
+                    value: &'__nutype_sw #inner_type,
+                }
+                impl #wrapper_impl_generics ::serde::Serialize for __SerializeWith #wrapper_type_generics #wrapper_where_clause {
+                    fn serialize<__S>(&self, serializer: __S) -> ::core::result::Result<__S::Ok, __S::Error>
+                    where
+                        __S: ::serde::Serializer
+                    {
+                        #serialize_with(self.value, serializer)
+                    }
+                }
+                ::serde::ser::Serializer::serialize_newtype_struct(
+                    serializer,
+                    #type_name_str,
+                    &__SerializeWith { value: &self.0 },
+                )
+            }
+        }
+    };
+
+    quote! {
+        impl #impl_generics ::serde::Serialize for #type_name #type_generics #where_clause {
+            fn serialize<S>(&self, serializer: S) -> ::core::result::Result<S::Ok, S::Error>
+            where
+                S: ::serde::Serializer
+            {
+                #body
+            }
+        }
+    }
+}
+
+pub fn gen_impl_trait_serde_deserialize(
+    type_name: &TypeName,
+    type_generics: &Generics,
+    inner_type: impl Into<InnerType>,
+    maybe_error_type_name: Option<&ErrorTypePath>,
+    serde_customization: &SerdeCustomization,
+) -> TokenStream {
+    let inner_type: InnerType = inner_type.into();
+
+    // How a raw inner value becomes the newtype: ALWAYS through the
+    // constructor, so sanitization and validation run regardless of any custom
+    // deserialization function. `deserializer_generic` is the ident of the
+    // deserializer's generic parameter in the surrounding scope.
+    let raw_value_to_result = |deserializer_generic: TokenStream| -> TokenStream {
+        if maybe_error_type_name.is_some() {
+            let type_name_str = type_name.to_string();
+            quote! {
+                #type_name::try_new(raw_value).map_err(|validation_error| {
+                    // Add a hint about which type is causing the error,
+                    <#deserializer_generic::Error as serde::de::Error>::custom(core::format_args!("{validation_error} Expected valid {}", #type_name_str))
+                })
+            }
+        } else {
+            quote! {
+                Ok(#type_name::new(raw_value))
+            }
+        }
+    };
+
+    // How the raw inner value is obtained from a deserializer:
+    // the custom function if given, the inner type's Deserialize otherwise.
+    let gen_deserialize_call = |deserializer: TokenStream| -> TokenStream {
+        match serde_customization.effective_deserialize_with() {
+            Some(deserialize_with) => quote!(#deserialize_with(#deserializer)),
+            None => quote!(<#inner_type as ::serde::Deserialize>::deserialize(#deserializer)),
+        }
+    };
+
+    let expecting_str = format!("tuple struct {type_name}");
+    let type_name_str = type_name.to_string();
+
+    // type generics + 'de lifetime for Deserialize
+    let all_generics = {
+        let mut all_generics = type_generics.clone();
+        all_generics.params.push(syn::parse_quote!('de));
+        all_generics
+    };
+
+    // Turn `<'de, T>` into `<'de, T: Deserialize<'de>>`
+    let all_generics_with_deserialize_bound =
+        add_bound_to_all_type_params(&all_generics, syn::parse_quote!(::serde::Deserialize<'de>));
+
+    // Split for the outer impl (with 'de)
+    let SplitGenerics {
+        impl_generics: all_impl_generics,
+        type_generics: all_type_generics,
+        where_clause: all_where_clause,
+    } = SplitGenerics::new(&all_generics_with_deserialize_bound);
+
+    // Split for the type itself (without 'de)
+    let SplitGenerics {
+        type_generics: inner_type_generics,
+        ..
+    } = SplitGenerics::new(type_generics);
+
+    // For the visitor struct, we need generics without bounds but with 'de
+    let SplitGenerics {
+        impl_generics: visitor_impl_generics,
+        type_generics: _visitor_type_generics,
+        where_clause: visitor_where_clause,
+    } = SplitGenerics::new(&all_generics);
+
+    if serde_customization.is_transparent() {
+        // Transparent: no newtype framing, deserialize exactly as the inner
+        // value (mirrors serde's own `#[serde(transparent)]`). No visitor is
+        // needed because there is no framing to negotiate.
+        let deserialize_call = gen_deserialize_call(quote!(deserializer));
+        let to_result = raw_value_to_result(quote!(D));
+        quote! {
+            impl #all_impl_generics ::serde::Deserialize<'de> for #type_name #inner_type_generics #all_where_clause {
+                fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> ::core::result::Result<Self, D::Error> {
+                    let raw_value: #inner_type = match #deserialize_call {
+                        Ok(val) => val,
+                        Err(err) => return Err(err)
+                    };
+                    #to_result
+                }
+            }
+        }
+    } else {
+        let deserialize_call = gen_deserialize_call(quote!(deserializer));
+        let to_result = raw_value_to_result(quote!(DE));
+        quote! {
+            impl #all_impl_generics ::serde::Deserialize<'de> for #type_name #inner_type_generics #all_where_clause {
+                fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> ::core::result::Result<Self, D::Error> {
+                    struct __Visitor #visitor_impl_generics #visitor_where_clause {
+                        marker: ::core::marker::PhantomData<#type_name #inner_type_generics>,
+                        lifetime: ::core::marker::PhantomData<&'de ()>,
+                    }
+
+                    impl #all_impl_generics ::serde::de::Visitor<'de> for __Visitor #all_type_generics #all_where_clause {
+                        type Value = #type_name #inner_type_generics;
+
+                        fn expecting(&self, formatter: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                            write!(formatter, #expecting_str)
+                        }
+
+                        fn visit_newtype_struct<DE>(self, deserializer: DE) -> ::core::result::Result<Self::Value, DE::Error>
+                        where
+                            DE: ::serde::Deserializer<'de>
+                        {
+                            let raw_value: #inner_type = match #deserialize_call {
+                                Ok(val) => val,
+                                Err(err) => return Err(err)
+                            };
+                            #to_result
+                        }
+                    }
+
+                    ::serde::de::Deserializer::deserialize_newtype_struct(
+                        deserializer,
+                        #type_name_str,
+                        __Visitor {
+                            marker: Default::default(),
+                            lifetime: Default::default(),
+                        }
+                    )
+                }
+            }
+        }
+    }
+}
+
+pub fn gen_impl_trait_default(
+    type_name: &TypeName,
+    generics: &Generics,
+    default_value: impl ToTokens,
+    has_validation: bool,
+) -> TokenStream {
+    let SplitGenerics {
+        impl_generics,
+        type_generics,
+        where_clause,
+    } = SplitGenerics::new(generics);
+
+    if has_validation {
+        let tp = type_name.to_string();
+        quote!(
+            impl #impl_generics ::core::default::Default for #type_name #type_generics #where_clause {
+                fn default() -> Self {
+                    Self::try_new(#default_value)
+                        .unwrap_or_else(|err| {
+                            let tp = #tp;
+                            panic!("\nDefault value for type `{tp}` is invalid.\nERROR: {err:?}\n");
+                        })
+                }
+            }
+        )
+    } else {
+        quote!(
+            impl #impl_generics ::core::default::Default for #type_name #type_generics #where_clause {
+                #[inline]
+                fn default() -> Self {
+                    Self::new(#default_value)
+                }
+            }
+        )
+    }
+}

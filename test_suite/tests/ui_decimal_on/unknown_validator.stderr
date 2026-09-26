@@ -1,0 +1,6 @@
+error: Unknown validation attribute: `finite`.
+       Possible attributes are `greater`, `greater_or_equal`, `less`, `less_or_equal`, `predicate`, `with`, `error`.
+ --> tests/ui_decimal_on/unknown_validator.rs:7:14
+  |
+7 |     validate(finite),
+  |              ^^^^^^

@@ -1,0 +1,116 @@
+### v0.8.0 - 2026-09-20
+- **[FEATURE]** Attribute passthrough (see [#229](https://github.com/greyblake/nutype/issues/229)): attributes written on the struct and on the inner field are now forwarded verbatim onto the generated type, so they can be read by third-party derives and the compiler. Examples: `#[repr(transparent)]`, `#[sqlx(transparent)]` (with `derive_unchecked(sqlx::Type)`), `#[garde(length(min = 1))]` (with `derive_unchecked(garde::Validate)`). Resolves [#228](https://github.com/greyblake/nutype/issues/228) and the attribute half of [#191](https://github.com/greyblake/nutype/issues/191).
+- **[FEATURE]** Serde customization (see [#201](https://github.com/greyblake/nutype/issues/201)): nutype's generated `Serialize`/`Deserialize` impls now honor field-level `#[serde(with = "...")]`, `#[serde(serialize_with = "...")]`, `#[serde(deserialize_with = "...")]` and struct-level `#[serde(transparent)]`. Sanitization and validation still always run on deserialization.
+- **[FIX]** Field attributes on newtypes with custom ("any") inner types no longer leak into type positions of the generated code (previously they could produce confusing compile errors).
+- **[BEHAVIOR]** Previously, non-doc attributes on the struct were rejected with an error and attributes on the inner field were silently dropped. Both are now forwarded (serde attributes are consumed and integrated instead; `#[cfg]` on the inner field is rejected explicitly).
+- **[FEATURE]** Support `rust_decimal::Decimal` as an inner type behind the `rust_decimal` feature flag, with the standard numeric validators and sanitizers (see [#242](https://github.com/greyblake/nutype/issues/242)).
+- **[FEATURE]** Friendlier error when a `#[nutype(...)]` attribute is mistyped: suggests the closest match (e.g. `validte` -> `validate`) and lists the available nutype attributes (see [#240](https://github.com/greyblake/nutype/issues/240)).
+- **[FIX]** Fix misleading error for value-type mismatches in validators (see [#241](https://github.com/greyblake/nutype/issues/241)).
+- **[FIX]** Improve rust-analyzer resilience: when `#[nutype(...)]` arguments fail to parse (e.g. while still being typed), emit a best-effort type skeleton alongside the error so the newtype stays resolvable and downstream completions keep working (see [#178](https://github.com/greyblake/nutype/issues/178)).
+- **[FIX]** Correct the validation error `Display` message for float newtypes: `less` now reads "The value must be less than ..." and `less_or_equal` reads "The value must be less or equal to ..." (the two were previously swapped). Integer and decimal were already correct.
+- **[FIX]** Macro expansion is now reproducible: traits were collected into a `HashSet`, whose iteration order varies between expansions, so the order of derives and generated impls in the emitted code was nondeterministic. Traits are now kept in a `BTreeSet` and emitted in a stable order.
+- **[INTERNAL]** Consolidate the integer, float and decimal backends onto a shared numeric code-generation and validation layer (`common/generate/numeric.rs` and shared helpers in `common/validate.rs`), removing a large amount of duplicated code. No change to generated code or public API.
+- **[IMPROVEMENT]** Mark the generated `new`, `try_new` and `new_unchecked` constructors with `#[inline]` so they can be inlined across crate boundaries, matching the existing `into_inner` (see [#237](https://github.com/greyblake/nutype/issues/237)).
+
+### v0.7.0 - 2026-04-25
+- **[BREAKING]** Rename `derive_unsafe` to `derive_unchecked` (both the feature flag and the attribute).
+- **[FEATURE]** Support `cfg_attr` for conditional derives, e.g. `cfg_attr(feature = "serde", derive(Serialize, Deserialize))`. Supports complex predicates and multiple entries.
+- **[FEATURE]** Support `where` clauses in generic newtypes, including Higher-Ranked Trait Bounds (HRTB) like `for<'a> &'a C: IntoIterator` (see [#160](https://github.com/greyblake/nutype/issues/160)).
+- **[FEATURE]** Ability to control constructor visibility with `constructor(visibility = ...)` attribute (see [#211](https://github.com/greyblake/nutype/issues/211)).
+- **[FEATURE]** Add `len_utf16_min` and `len_utf16_max` validators for string types to validate UTF-16 code unit length (useful for JavaScript interop) (see [#162](https://github.com/greyblake/nutype/issues/162)).
+- **[FEATURE]** Ability to derive [`Valuable`](https://docs.rs/valuable/0.1.1/valuable/trait.Valuable.html) (requires `valuable` feature).
+
+### v0.6.2 - 2025-06-30
+- **[FEATURE]** Introduce `derive_unsafe(..)` attribute to derive any arbitrary trait (requires `derive_unsafe` feature to be enabled).
+- **[FIX]** Update Rust edition: 2021 -> 2024.
+- **[FIX]** Improve error messages for `len_char_max` and `len_char_min` validators.
+
+### v0.6.1 - 2025-02-09
+- **[FIX]** Fix `derive(Deserialize)` for no_std.
+
+### v0.6.0 - 2025-02-02
+- **[FEATURE]** Ability to instantiate types in `const` context, when declared with `const_fn` flag.
+- **[FEATURE]** Support `derive(IntoIterator)` for inner types that implement `IntoIterator`.
+- **[FIX]** Enable `&'a str` as an inner type.
+- **[BREAKING]** Fallible `::new()` constructor is removed (was deprecated in 0.4.3).
+
+### v0.5.1 - 2024-12-20
+
+* **[FEATURE]** In `no_std` generate implementation of `::core::error::Error` if Rust version is 1.81 or higher.
+* **[FIX]** Enable to specify custom error as a path (see [#186](https://github.com/greyblake/nutype/issues/186), [#187](https://github.com/greyblake/nutype/pull/187))
+* **[FIX]** Make `Deserialize` derive compile when combination of `no_std` and `serde` features are used ([#182](https://github.com/greyblake/nutype/issues/182))
+* **[FIX]** Fix lint warnings about inner generated module
+* **[FIX]** Fix a conflict when used with `borsch` crate ([#195](https://github.com/greyblake/nutype/pull/195))
+
+### v0.5.0 - 2024-09-02
+
+- **[FEATURE]** Added support for custom error types and validation functions via the `error` and `with` attributes.
+- **[BREAKING]** Replaced `lazy_static` with [`std::sync::LazyLock`](https://doc.rust-lang.org/stable/std/sync/struct.LazyLock.html) for regex validation. This requires Rust 1.80 or higher and may cause compilation issues on older Rust versions due to the use of `std::sync::LazyLock`. If upgrading Rust isn't an option, you can still use `lazy_static` explicitly as a workaround.
+- **[BREAKING]** The fallible `::new()` constructor has been fully replaced by `::try_new()`.
+
+### v0.4.3 - 2024-07-06
+
+* Support generics
+* [DEPRECATION] Fallible constructor `::new()` is deprecated. Users should use `::try_new()` instead.
+* [FIX] Use absolute path for `::core::result::Result` when generating code for `derive(TryFrom)`.
+
+### v0.4.2 - 2024-04-07
+
+* Support `no_std` ( the dependency needs to be declared as `nutype = { default-features = false }` )
+* Support integration with [`arbitrary`](https://crates.io/crates/arbitrary) crate (see `arbitrary` feature).
+  * Support `Arbitrary` for integer types
+  * Support `Arbitrary` for float types
+  * Support `Arbitrary` for string inner types
+  * Support `Arbitrary` for any inner types
+* Possibility to specify boundaries (`greater`, `greater_or_equal`, `less`, `less_or_equal`, `len_char_min`, `len_char_max`) with expressions or named constants.
+* Add `#[inline]` attribute to trivial functions
+* Improve error messages
+
+### v0.4.1 - 2024-04-07
+
+* Failed release. Includes everything from v0.4.2 except support of `Arbitrary` for `String` based types.
+
+### v0.4.0 - 2023-11-21
+* Support of arbitrary inner types with custom sanitizers and validators.
+* Add numeric validator `greater`
+* Add numeric validator `less`
+* [BREAKING] Removal of asterisk derive
+* [BREAKING] Use commas to separate high level attributes
+* [BREAKING] Traits are derived with `#[nutype(derive(Debug))]`. The regular `#[derive(Debug)]` syntax is not supported anymore.
+* [BREAKING] Validator `with` has been renamed to `predicate` to reflect the boolean nature of its range
+* [BREAKING] String validator `min_len` has been renamed to `len_char_min` to reflect that is based on UTF8 chars.
+* [BREAKING] String validator `max_len` has been renamed to `len_char_max` to reflect that is based on UTF8 chars.
+* [BREAKING] Rename numeric validator `max` to `less_or_equal`
+* [BREAKING] Rename numeric validator `min` to `greater_or_equal`
+* [BREAKING] Rename error variants to follow the following formula: `<ValidationRule>Violated`. This implies the following renames:
+  * `TooShort` -> `LenCharMinViolated`
+  * `TooLong` -> `LenCharMaxViolated`
+  * `Empty` -> `NotEmptyViolated`
+  * `RegexMismatch` -> `RegexViolated`
+  * `Invalid` -> `PredicateViolated`
+  * `TooBig` -> `LessOrEqualViolated`
+  * `TooSmall` -> `GreaterOrEqualViolated`
+  * `NotFinite` -> `FiniteViolated`
+* Better error messages: in case of unknown attribute, validator or sanitizer the possible values are listed.
+* [FIX] Make derived `Deserialize` work with RON format
+
+### v0.3.1 - 2023-06-30
+* Support deriving of `Deref`
+
+### v0.3.0 - 2023-06-25
+* [BREAKING] `min_len` and `max_len` validators run against number of characters in a string (`val.chars().count()`), not number of bytes (`val.len()`).
+* Add `finite` validation for float types which checks against NaN and infinity.
+* Support deriving of `Default`
+* Support deriving of `Eq` and `Ord` on float types (if `finite` validation is present)
+* Support deriving of `TryFrom` for types without validation (in this case Error type is `std::convert::Infallible`)
+
+### v0.2.0 - 2023-04-13
+
+* [BREAKING] Rename string validator `present` -> `not_empty`. Rename error variant `Missing` -> `Empty`.
+* [BREAKING] Rename feature `serde1` to `serde`.
+* Introduce `new_unchecked` feature flag, that allows to bypass sanitization and validation.
+* Support derive of `JsonSchema` of `schemars` crate (requires `schemars08` feature).
+* Support string validation with `regex` (requires `regex` feature).
+
+### v0.1.1 - 2023-02-11
+* Initial release

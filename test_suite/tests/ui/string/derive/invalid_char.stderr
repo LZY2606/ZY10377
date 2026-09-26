@@ -1,0 +1,5 @@
+error: expected identifier
+ --> tests/ui/string/derive/invalid_char.rs:5:19
+  |
+5 |     derive(Debug, !),
+  |                   ^

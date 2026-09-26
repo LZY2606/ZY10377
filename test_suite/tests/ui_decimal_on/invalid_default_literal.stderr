@@ -1,0 +1,5 @@
+error: Invalid decimal default value `1e40`: Scale exceeds the maximum precision allowed: 40 > 28
+ --> tests/ui_decimal_on/invalid_default_literal.rs:8:15
+  |
+8 |     default = 1e40,
+  |               ^^^^

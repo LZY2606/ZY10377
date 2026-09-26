@@ -1,0 +1,6 @@
+error: Trait Ord requires PartialOrd.
+       Übung macht den Meister.
+ --> tests/ui/float/derive/ord_without_partial_ord.rs:5:27
+  |
+5 |     derive(PartialEq, Eq, Ord)
+  |                           ^^^

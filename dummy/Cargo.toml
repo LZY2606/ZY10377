@@ -1,0 +1,17 @@
+[package]
+name = "dummy"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+nutype = { path = "../nutype", features = ["serde", "new_unchecked", "schemars08", "regex", "arbitrary", "derive_unchecked"] }
+serde = "*"
+serde_json = "*"
+schemars = "*"
+regex = "*"
+once_cell = "*"
+ron = "0.8.1"
+arbitrary = "1.3.2"
+num = "0.4.3"

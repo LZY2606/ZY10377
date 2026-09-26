@@ -1,0 +1,51 @@
+[package]
+name = "nutype_macros"
+version = "0.8.0"
+edition = "2024"
+authors = ["Serhii Potapov <blake131313@gmail.com>"]
+description = "The newtype with guarantees."
+keywords = ["newtype", "validation", "sanitization", "derive", "invariant"]
+license = "MIT"
+repository = "https://github.com/greyblake/nutype"
+homepage = "https://github.com/greyblake/nutype"
+documentation = "https://docs.rs/nutype"
+readme = "README.md"
+categories = ["data-structures", "rust-patterns"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+proc-macro2 = "1.0"
+quote = "1.0"
+syn = { version = "2.0", features = ["extra-traits", "full"] }
+
+# regex is used at compile-time to verify that a string literal provided
+# as `regex = "^foo|bar$"` can be compiled to a Regex without errors.
+regex = { version = "1", optional = true }
+# rust_decimal is used at compile-time to parse decimal literals provided as
+# bound values (e.g. `greater = 0.5`) via its `FromStr` implementation, and to
+# emit them back losslessly. It is only pulled in when the `rust_decimal`
+# feature is enabled.
+rust_decimal = { version = "1", default-features = false, optional = true }
+cfg-if = "1.0"
+kinded = "0.5"
+urlencoding = "2.0"
+
+[build-dependencies]
+rustc_version = "0.4.1"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(ERROR_IN_CORE)'] }
+
+[lib]
+proc-macro = true
+
+[features]
+std = []
+serde = []
+schemars08 = []
+new_unchecked = []
+arbitrary = []
+valuable = []
+derive_unchecked = []
+rust_decimal = ["dep:rust_decimal"]

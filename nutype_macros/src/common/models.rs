@@ -1,0 +1,1064 @@
+mod error_type_path;
+
+use alloc::collections::BTreeSet;
+use core::{fmt::Debug, ops::Add};
+use kinded::Kinded;
+use syn::Generics;
+
+use proc_macro2::{Span, TokenStream};
+use quote::{ToTokens, quote};
+use syn::{
+    Attribute, ExprClosure, Path,
+    parse::{Parse, ParseStream},
+};
+
+#[cfg(feature = "rust_decimal")]
+use crate::decimal::models::DecimalInnerType;
+use crate::{
+    any::models::AnyInnerType, float::models::FloatInnerType, integer::models::IntegerInnerType,
+    string::models::StringInnerType,
+};
+
+use super::generate::type_custom_closure;
+use super::parse::RawValidation;
+
+pub use error_type_path::ErrorTypePath;
+
+/// A spanned item. An item can be anything that cares a domain value.
+/// Keeping a span allows to throw good precise error messages at the validation stage.
+#[derive(Debug, Clone)]
+pub struct SpannedItem<T> {
+    pub item: T,
+    pub span: Span,
+}
+
+impl<T> SpannedItem<T> {
+    pub fn new(item: T, span: Span) -> Self {
+        Self { item, span }
+    }
+
+    pub fn span(&self) -> Span {
+        self.span
+    }
+}
+
+impl<T: Kinded> Kinded for SpannedItem<T> {
+    type Kind = <T as Kinded>::Kind;
+
+    fn kind(&self) -> Self::Kind {
+        self.item.kind()
+    }
+}
+
+/// Represents the inner type of a newtype.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InnerType {
+    String(StringInnerType),
+    Integer(IntegerInnerType),
+    Float(FloatInnerType),
+    #[cfg(feature = "rust_decimal")]
+    Decimal(DecimalInnerType),
+    Any(AnyInnerType),
+}
+
+impl From<IntegerInnerType> for InnerType {
+    fn from(tp: IntegerInnerType) -> InnerType {
+        InnerType::Integer(tp)
+    }
+}
+
+#[cfg(feature = "rust_decimal")]
+impl From<DecimalInnerType> for InnerType {
+    fn from(tp: DecimalInnerType) -> InnerType {
+        InnerType::Decimal(tp)
+    }
+}
+
+#[cfg(feature = "rust_decimal")]
+impl From<&DecimalInnerType> for InnerType {
+    fn from(tp: &DecimalInnerType) -> InnerType {
+        InnerType::Decimal(*tp)
+    }
+}
+
+impl From<&IntegerInnerType> for InnerType {
+    fn from(tp: &IntegerInnerType) -> InnerType {
+        InnerType::Integer(*tp)
+    }
+}
+
+impl From<FloatInnerType> for InnerType {
+    fn from(tp: FloatInnerType) -> InnerType {
+        InnerType::Float(tp)
+    }
+}
+
+impl From<&FloatInnerType> for InnerType {
+    fn from(tp: &FloatInnerType) -> InnerType {
+        InnerType::Float(*tp)
+    }
+}
+
+impl From<StringInnerType> for InnerType {
+    fn from(string_inner_type: StringInnerType) -> InnerType {
+        InnerType::String(string_inner_type)
+    }
+}
+
+impl From<AnyInnerType> for InnerType {
+    fn from(any_inner_type: AnyInnerType) -> InnerType {
+        InnerType::Any(any_inner_type)
+    }
+}
+
+impl From<&AnyInnerType> for InnerType {
+    fn from(any_inner_type: &AnyInnerType) -> InnerType {
+        InnerType::Any(any_inner_type.clone())
+    }
+}
+
+impl ToTokens for InnerType {
+    fn to_tokens(&self, token_stream: &mut TokenStream) {
+        match self {
+            InnerType::String(string_type) => {
+                string_type.to_tokens(token_stream);
+            }
+            InnerType::Integer(integer_type) => {
+                integer_type.to_tokens(token_stream);
+            }
+            InnerType::Float(float_type) => {
+                float_type.to_tokens(token_stream);
+            }
+            #[cfg(feature = "rust_decimal")]
+            InnerType::Decimal(decimal_type) => {
+                decimal_type.to_tokens(token_stream);
+            }
+            InnerType::Any(any_type) => {
+                any_type.to_tokens(token_stream);
+            }
+        };
+    }
+}
+
+macro_rules! define_ident_type {
+    ($tp_name:ident) => {
+        #[derive(Debug, Clone)]
+        pub struct $tp_name(proc_macro2::Ident);
+
+        impl $tp_name {
+            pub fn new(name: proc_macro2::Ident) -> Self {
+                Self(name)
+            }
+        }
+
+        impl core::fmt::Display for $tp_name {
+            fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+                write!(f, "{}", self.0)
+            }
+        }
+
+        impl ::quote::ToTokens for $tp_name {
+            fn to_tokens(&self, token_stream: &mut TokenStream) {
+                self.0.to_tokens(token_stream)
+            }
+        }
+    };
+}
+
+// A type that represents a newtype name.
+// For example: `Username`, `Email`, etc.
+define_ident_type!(TypeName);
+
+// A type that represents an error name which is returned by `FromStr` traits.
+// For example, if `TypeName` is `Amount`, then this would be `AmountParseError`.
+define_ident_type!(ParseErrorTypeName);
+
+// Module name, where the type is placed.
+define_ident_type!(ModuleName);
+
+#[derive(Debug)]
+pub struct Meta {
+    pub type_name: TypeName,
+    pub inner_type: InnerType,
+    pub vis: syn::Visibility,
+    pub doc_attrs: Vec<Attribute>,
+    pub generics: Generics,
+
+    /// Struct-level attributes that are forwarded verbatim onto the generated
+    /// struct (e.g. `#[repr(transparent)]`, `#[sqlx(transparent)]`).
+    pub forwarded_attrs: Vec<Attribute>,
+
+    /// Field-level attributes that are forwarded verbatim onto the generated
+    /// inner field (e.g. `#[garde(length(min = 1))]`).
+    pub inner_field_attrs: Vec<Attribute>,
+
+    /// Serde attributes consumed by nutype (never forwarded), see
+    /// [`SerdeCustomization`].
+    pub serde_customization: SerdeCustomization,
+}
+
+impl Meta {
+    pub fn into_typed_meta(self, attrs: TokenStream) -> (TypedMeta, InnerType) {
+        let Self {
+            doc_attrs,
+            type_name,
+            inner_type,
+            vis,
+            generics,
+            forwarded_attrs,
+            inner_field_attrs,
+            serde_customization,
+        } = self;
+        let typed_meta = TypedMeta {
+            doc_attrs,
+            type_name,
+            generics,
+            attrs,
+            vis,
+            forwarded_attrs,
+            inner_field_attrs,
+            serde_customization,
+        };
+        (typed_meta, inner_type)
+    }
+}
+
+/// Meta information with attributes that can be given to Newtype::expand to generate an
+/// implementation for a particular type.
+#[derive(Debug)]
+pub struct TypedMeta {
+    pub type_name: TypeName,
+
+    /// Attributes given to #[nutype] macro
+    pub attrs: TokenStream,
+
+    pub vis: syn::Visibility,
+    pub doc_attrs: Vec<Attribute>,
+    pub generics: Generics,
+
+    /// Struct-level attributes forwarded verbatim onto the generated struct.
+    pub forwarded_attrs: Vec<Attribute>,
+
+    /// Field-level attributes forwarded verbatim onto the generated inner field.
+    pub inner_field_attrs: Vec<Attribute>,
+
+    /// Serde attributes consumed by nutype (never forwarded).
+    pub serde_customization: SerdeCustomization,
+}
+
+/// Validated model, that represents precisely what needs to be generated.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+pub enum Guard<Sanitizer, Validator> {
+    WithoutValidation {
+        sanitizers: Vec<Sanitizer>,
+    },
+    WithValidation {
+        sanitizers: Vec<Sanitizer>,
+        validation: Validation<Validator>,
+    },
+}
+
+#[derive(Debug)]
+pub enum Validation<Validator> {
+    Custom {
+        /// Custom validation function that should return `Result<(), ErrorType>`
+        with: CustomFunction,
+
+        /// Name of the error type. Since the type is defined by user, the macro must not generate
+        /// it.
+        error_type_path: ErrorTypePath,
+    },
+    Standard {
+        /// List of the standard validators
+        validators: Vec<Validator>,
+
+        /// Name of the error type. The #[nutype] macro must generate definition of this type.
+        error_type_path: ErrorTypePath,
+    },
+}
+
+impl<V> Validation<V> {
+    pub fn error_type_path(&self) -> &ErrorTypePath {
+        match self {
+            Self::Custom {
+                error_type_path, ..
+            } => error_type_path,
+            Self::Standard {
+                error_type_path, ..
+            } => error_type_path,
+        }
+    }
+}
+
+impl<Sanitizer, Validator> Guard<Sanitizer, Validator> {
+    pub fn maybe_error_type_path(&self) -> Option<&ErrorTypePath> {
+        match self {
+            Self::WithoutValidation { .. } => None,
+            Self::WithValidation { validation, .. } => Some(validation.error_type_path()),
+        }
+    }
+}
+
+/// Parsed attributes (`sanitize`, `validate`, `new_unchecked`).
+#[derive(Debug)]
+pub struct Attributes<G, DT> {
+    /// Guard contains sanitizers and validators
+    pub guard: G,
+
+    /// `new_unchecked` flag
+    pub new_unchecked: NewUnchecked,
+
+    /// `const_fn` flag
+    pub const_fn: ConstFn,
+
+    /// Visibility for constructor functions (`new()` and `try_new()`).
+    /// Parsed from `constructor(visibility = ...)` attribute.
+    pub constructor_visibility: ConstructorVisibility,
+
+    /// Value for Default trait. Provide with `default = `
+    pub default: Option<syn::Expr>,
+
+    /// List of traits that are derived with `derive(...)` attribute.
+    pub derive_traits: Vec<DT>,
+
+    /// List of unchecked traits that are derived with `derive_unchecked(...)` attribute.
+    pub derive_unchecked_traits: Vec<SpannedDeriveUnsafeTrait>,
+
+    /// Conditional entries from `cfg_attr(...)`.
+    pub cfg_attr_entries: Vec<CfgAttrEntry>,
+}
+
+/// Represents a value known at compile time or an expression.
+/// Knowing value at compile time allows to run some extra validations to prevent potential errors.
+#[derive(Debug, Clone)]
+pub enum ValueOrExpr<T> {
+    Value(T),
+    Expr(syn::Expr),
+}
+
+impl<T: ToTokens> ToTokens for ValueOrExpr<T> {
+    fn to_tokens(&self, token_stream: &mut TokenStream) {
+        match self {
+            Self::Value(value) => {
+                value.to_tokens(token_stream);
+            }
+            Self::Expr(expr) => {
+                expr.to_tokens(token_stream);
+            }
+        };
+    }
+}
+
+impl<T> Add<T> for ValueOrExpr<T>
+where
+    T: Add<T, Output = T> + ToTokens,
+{
+    type Output = ValueOrExpr<T>;
+
+    fn add(self, rhs: T) -> Self::Output {
+        match self {
+            Self::Value(lhs) => Self::Value(lhs + rhs),
+            Self::Expr(lhs) => {
+                let token_stream = quote!(#lhs + #rhs);
+                let expr = syn::parse2(token_stream)
+                    .expect("Failed to parse token stream in ValueOrExpr::add");
+                Self::Expr(expr)
+            }
+        }
+    }
+}
+
+impl<Sanitizer, Validator> Guard<Sanitizer, Validator> {
+    pub fn has_validation(&self) -> bool {
+        match self {
+            Self::WithoutValidation { .. } => false,
+            Self::WithValidation { .. } => true,
+        }
+    }
+
+    pub fn standard_validators(&self) -> Option<&Vec<Validator>> {
+        match self {
+            Self::WithValidation { validation, .. } => match validation {
+                Validation::Standard { validators, .. } => Some(validators),
+                Validation::Custom { .. } => None,
+            },
+            Self::WithoutValidation { .. } => None,
+        }
+    }
+}
+
+/// Parsed by not yet validated
+#[derive(Debug)]
+pub struct RawGuard<Sanitizer, Validator> {
+    pub sanitizers: Vec<Sanitizer>,
+    pub validation: Option<RawValidation<Validator>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DeriveTrait {
+    // Standard library
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    FromStr,
+    AsRef,
+    From,
+    TryFrom,
+    Into,
+    Hash,
+    Borrow,
+    Display,
+    Default,
+    Deref,
+    IntoIterator,
+
+    // External crates
+    //
+    #[cfg_attr(not(feature = "serde"), allow(dead_code))]
+    SerdeSerialize,
+    #[cfg_attr(not(feature = "serde"), allow(dead_code))]
+    SerdeDeserialize,
+
+    #[cfg_attr(not(feature = "schemars08"), allow(dead_code))]
+    SchemarsJsonSchema,
+
+    #[cfg_attr(not(feature = "arbitrary"), allow(dead_code))]
+    ArbitraryArbitrary,
+
+    #[cfg_attr(not(feature = "valuable"), allow(dead_code))]
+    ValuableValuable,
+}
+
+impl core::fmt::Display for DeriveTrait {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let name = match self {
+            DeriveTrait::Debug => "Debug",
+            DeriveTrait::Clone => "Clone",
+            DeriveTrait::Copy => "Copy",
+            DeriveTrait::PartialEq => "PartialEq",
+            DeriveTrait::Eq => "Eq",
+            DeriveTrait::PartialOrd => "PartialOrd",
+            DeriveTrait::Ord => "Ord",
+            DeriveTrait::FromStr => "FromStr",
+            DeriveTrait::AsRef => "AsRef",
+            DeriveTrait::From => "From",
+            DeriveTrait::TryFrom => "TryFrom",
+            DeriveTrait::Into => "Into",
+            DeriveTrait::Hash => "Hash",
+            DeriveTrait::Borrow => "Borrow",
+            DeriveTrait::Display => "Display",
+            DeriveTrait::Default => "Default",
+            DeriveTrait::Deref => "Deref",
+            DeriveTrait::IntoIterator => "IntoIterator",
+            DeriveTrait::SerdeSerialize => "Serialize",
+            DeriveTrait::SerdeDeserialize => "Deserialize",
+            DeriveTrait::SchemarsJsonSchema => "JsonSchema",
+            DeriveTrait::ArbitraryArbitrary => "Arbitrary",
+            DeriveTrait::ValuableValuable => "Valuable",
+        };
+        write!(f, "{name}")
+    }
+}
+
+pub type SpannedDeriveTrait = SpannedItem<DeriveTrait>;
+
+/// The inner attribute of a `cfg_attr(...)` entry.
+#[derive(Debug)]
+// Suppress dead_code warning: `DeriveUnchecked` is only constructed when
+// the `derive_unchecked` feature is enabled.
+#[allow(dead_code)]
+pub enum CfgAttrContent {
+    /// `cfg_attr(<predicate>, derive(...))`
+    Derive(Vec<SpannedDeriveTrait>),
+
+    /// `cfg_attr(<predicate>, derive_unchecked(...))`
+    DeriveUnchecked(Vec<SpannedDeriveUnsafeTrait>),
+}
+
+/// A single `cfg_attr(<predicate>, <attribute>)` entry parsed from `#[nutype(...)]`.
+/// The predicate is stored as raw tokens  - the proc macro does not evaluate it.
+#[derive(Debug)]
+pub struct CfgAttrEntry {
+    pub predicate: TokenStream,
+    pub content: CfgAttrContent,
+}
+
+/// Result of trait validation, containing typed traits for both unconditional
+/// and conditional derive entries.
+pub struct ValidatedDerives<TypedTrait> {
+    /// Typed traits from unconditional `derive(...)`.
+    pub unconditional: BTreeSet<TypedTrait>,
+
+    /// Typed traits from `cfg_attr(...)` entries, grouped by predicate.
+    pub conditional: Vec<ValidatedCfgAttrDerives<TypedTrait>>,
+}
+
+impl<T: TypeTrait> ValidatedDerives<T> {
+    pub fn has_default_trait(&self) -> bool {
+        self.unconditional.iter().any(|t| t.is_default())
+            || self
+                .conditional
+                .iter()
+                .any(|entry| entry.traits.iter().any(|t| t.is_default()))
+    }
+}
+
+/// A single cfg_attr derive group after validation and type conversion.
+pub struct ValidatedCfgAttrDerives<TypedTrait> {
+    pub predicate: TokenStream,
+    pub traits: Vec<TypedTrait>,
+}
+
+/// A single predicate group for conditional code generation.
+/// Contains either typed derive traits or unchecked derive traits (not both).
+pub struct ConditionalDeriveGroup<TypedTrait> {
+    pub predicate: TokenStream,
+
+    /// Typed traits from `cfg_attr(pred, derive(...))`  - already validated and converted.
+    pub typed_traits: Vec<TypedTrait>,
+
+    /// Unchecked traits from `cfg_attr(pred, derive_unchecked(...))`  - passed through as-is.
+    pub unchecked_traits: Vec<SpannedDeriveUnsafeTrait>,
+}
+
+/// A trait that is derive with `derive_unchecked(...)` attribute.
+/// `derive_unchecked` simply bypasses traits into `derive(...)`. This allows
+/// allows to derive traits that nutype is not aware of.
+/// But since it's bypasses the validation, it's possible to derive traits that:
+/// - have a constructor function
+/// - have  mutable methods
+///
+/// Both of these can lead to nutype constraints being violated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeriveUnsafeTrait(::syn::Path);
+
+impl ToTokens for DeriveUnsafeTrait {
+    fn to_tokens(&self, token_stream: &mut TokenStream) {
+        self.0.to_tokens(token_stream);
+    }
+}
+
+pub type SpannedDeriveUnsafeTrait = SpannedItem<DeriveUnsafeTrait>;
+
+impl ToTokens for SpannedDeriveUnsafeTrait {
+    fn to_tokens(&self, token_stream: &mut TokenStream) {
+        self.item.to_tokens(token_stream);
+    }
+}
+
+impl Parse for SpannedDeriveUnsafeTrait {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let path: syn::Path = input.parse()?;
+        Ok(SpannedItem::new(DeriveUnsafeTrait(path), input.span()))
+    }
+}
+
+pub trait TypeTrait {
+    fn is_from_str(&self) -> bool;
+    fn is_default(&self) -> bool;
+    fn is_serde_serialize(&self) -> bool;
+    fn is_serde_deserialize(&self) -> bool;
+}
+
+/// Serde customization consumed by nutype from native serde attributes:
+/// field-level `#[serde(with = "..")]` / `#[serde(serialize_with = "..")]` /
+/// `#[serde(deserialize_with = "..")]` and struct-level `#[serde(transparent)]`.
+///
+/// nutype hand-writes its `Serialize`/`Deserialize` impls, so these attributes
+/// cannot be forwarded to a real serde derive; instead they are woven into the
+/// generated impls. Deserialization always still runs sanitization and
+/// validation, regardless of any custom function.
+#[derive(Debug, Default)]
+pub struct SerdeCustomization {
+    /// `#[serde(transparent)]` on the struct: drop the newtype framing and
+    /// serialize/deserialize exactly as the inner value.
+    pub transparent: Option<Span>,
+
+    /// `#[serde(with = "module")]` on the field.
+    pub with: Option<SpannedItem<Path>>,
+
+    /// `#[serde(serialize_with = "path")]` on the field.
+    pub serialize_with: Option<SpannedItem<Path>>,
+
+    /// `#[serde(deserialize_with = "path")]` on the field.
+    pub deserialize_with: Option<SpannedItem<Path>>,
+}
+
+impl SerdeCustomization {
+    pub fn is_transparent(&self) -> bool {
+        self.transparent.is_some()
+    }
+
+    /// The function to use for serialization, if any:
+    /// explicit `serialize_with`, or `<with_module>::serialize`.
+    pub fn effective_serialize_with(&self) -> Option<Path> {
+        self.serialize_with
+            .as_ref()
+            .map(|spanned| spanned.item.clone())
+            .or_else(|| {
+                self.with.as_ref().map(|spanned| {
+                    let module = &spanned.item;
+                    syn::parse_quote!(#module::serialize)
+                })
+            })
+    }
+
+    /// The function to use for deserialization, if any:
+    /// explicit `deserialize_with`, or `<with_module>::deserialize`.
+    pub fn effective_deserialize_with(&self) -> Option<Path> {
+        self.deserialize_with
+            .as_ref()
+            .map(|spanned| spanned.item.clone())
+            .or_else(|| {
+                self.with.as_ref().map(|spanned| {
+                    let module = &spanned.item;
+                    syn::parse_quote!(#module::deserialize)
+                })
+            })
+    }
+}
+
+/// The flag that indicates that a newtype will be generated with extra constructor,
+/// `::new_unchecked()` constructor which allows to avoid the guards.
+/// Generally, usage of `new_unchecked` is discouraged.
+#[derive(Debug, Default)]
+pub enum NewUnchecked {
+    #[default]
+    Off,
+
+    // `On` variant can be constructed when `new_unchecked` feature flag is enabled.
+    #[allow(dead_code)]
+    On,
+}
+
+/// The flag that indicates the functions must be generated with `const` keyword.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum ConstFn {
+    #[default]
+    NoConst,
+
+    Const,
+}
+
+impl ToTokens for ConstFn {
+    fn to_tokens(&self, token_stream: &mut TokenStream) {
+        match self {
+            Self::NoConst => {}
+            Self::Const => {
+                quote!(const).to_tokens(token_stream);
+            }
+        };
+    }
+}
+
+/// Visibility for constructor functions (`new()` and `try_new()`).
+/// By default, constructors are public.
+#[derive(Debug, Clone, Default)]
+pub enum ConstructorVisibility {
+    /// `pub fn new()` / `pub fn try_new()` - the default behavior
+    #[default]
+    Public,
+
+    /// `pub(crate) fn new()` / `pub(crate) fn try_new()` - accessible within the crate
+    PubCrate,
+
+    /// `pub(super) fn new()` / `pub(super) fn try_new()` - accessible only in the defining module
+    /// Note: We use `pub(super)` because nutype wraps the type in an internal module,
+    /// so `pub(super)` makes it accessible from the user's module but not outside.
+    Private,
+}
+
+impl ToTokens for ConstructorVisibility {
+    fn to_tokens(&self, token_stream: &mut TokenStream) {
+        match self {
+            Self::Public => {
+                quote!(pub).to_tokens(token_stream);
+            }
+            Self::PubCrate => {
+                quote!(pub(crate)).to_tokens(token_stream);
+            }
+            Self::Private => {
+                // Use pub(super) because nutype wraps types in an internal module.
+                // This makes the constructor accessible from the user's defining module
+                // but not from outside that module.
+                quote!(pub(super)).to_tokens(token_stream);
+            }
+        }
+    }
+}
+
+pub struct GenerateParams<IT, Trait, Guard> {
+    pub inner_type: IT,
+    pub doc_attrs: Vec<Attribute>,
+    pub traits: BTreeSet<Trait>,
+    pub unsafe_traits: Vec<SpannedDeriveUnsafeTrait>,
+    pub vis: syn::Visibility,
+    pub type_name: TypeName,
+    pub generics: Generics,
+    pub guard: Guard,
+    pub new_unchecked: NewUnchecked,
+    pub const_fn: ConstFn,
+    pub constructor_visibility: ConstructorVisibility,
+    pub maybe_default_value: Option<syn::Expr>,
+    /// Conditional derive groups, one per predicate.
+    pub conditional_derives: Vec<ConditionalDeriveGroup<Trait>>,
+    /// Struct-level attributes forwarded verbatim onto the generated struct.
+    pub forwarded_attrs: Vec<Attribute>,
+    /// Field-level attributes forwarded verbatim onto the generated inner field.
+    pub inner_field_attrs: Vec<Attribute>,
+    /// Serde attributes consumed by nutype (never forwarded).
+    pub serde_customization: SerdeCustomization,
+}
+
+pub trait Newtype {
+    type Sanitizer;
+    type Validator;
+    type TypedTrait: TypeTrait;
+    type InnerType;
+
+    #[allow(clippy::type_complexity)]
+    fn parse_attributes(
+        attrs: TokenStream,
+        type_name: &TypeName,
+    ) -> Result<Attributes<Guard<Self::Sanitizer, Self::Validator>, SpannedDeriveTrait>, syn::Error>;
+
+    fn validate(
+        guard: &Guard<Self::Sanitizer, Self::Validator>,
+        derive_traits: Vec<SpannedDeriveTrait>,
+        cfg_attr_entries: &[CfgAttrEntry],
+        maybe_default_value: &Option<syn::Expr>,
+        type_name: &TypeName,
+    ) -> Result<ValidatedDerives<Self::TypedTrait>, syn::Error>;
+
+    #[allow(clippy::type_complexity)]
+    fn generate(
+        params: GenerateParams<
+            Self::InnerType,
+            Self::TypedTrait,
+            Guard<Self::Sanitizer, Self::Validator>,
+        >,
+    ) -> Result<TokenStream, syn::Error>;
+
+    fn expand(
+        typed_meta: TypedMeta,
+        inner_type: Self::InnerType,
+    ) -> Result<TokenStream, syn::Error> {
+        let TypedMeta {
+            doc_attrs,
+            type_name,
+            attrs,
+            vis,
+            generics,
+            forwarded_attrs,
+            inner_field_attrs,
+            serde_customization,
+        } = typed_meta;
+        let Attributes {
+            guard,
+            new_unchecked,
+            const_fn,
+            constructor_visibility,
+            default: maybe_default_value,
+            derive_traits,
+            derive_unchecked_traits,
+            cfg_attr_entries,
+        } = Self::parse_attributes(attrs, &type_name)?;
+
+        let validated = Self::validate(
+            &guard,
+            derive_traits,
+            &cfg_attr_entries,
+            &maybe_default_value,
+            &type_name,
+        )?;
+
+        let conditional_derives =
+            build_conditional_derive_groups(validated.conditional, &cfg_attr_entries);
+
+        let generated_output = Self::generate(GenerateParams {
+            doc_attrs,
+            traits: validated.unconditional,
+            unsafe_traits: derive_unchecked_traits,
+            vis,
+            type_name,
+            generics,
+            guard,
+            new_unchecked,
+            const_fn,
+            constructor_visibility,
+            maybe_default_value,
+            inner_type,
+            conditional_derives,
+            forwarded_attrs,
+            inner_field_attrs,
+            serde_customization,
+        })?;
+        Ok(generated_output)
+    }
+}
+
+/// Build a list of ConditionalDeriveGroups from validated conditional derives and cfg_attr entries.
+/// Each validated Derive entry becomes its own group (with typed_traits only).
+/// Each DeriveUnchecked entry becomes its own group (with unchecked_traits only).
+/// Groups with the same predicate are NOT merged.
+pub fn build_conditional_derive_groups<TypedTrait>(
+    validated_conditional: Vec<ValidatedCfgAttrDerives<TypedTrait>>,
+    cfg_attr_entries: &[CfgAttrEntry],
+) -> Vec<ConditionalDeriveGroup<TypedTrait>> {
+    let mut groups: Vec<ConditionalDeriveGroup<TypedTrait>> = validated_conditional
+        .into_iter()
+        .map(|v| ConditionalDeriveGroup {
+            predicate: v.predicate,
+            typed_traits: v.traits,
+            unchecked_traits: vec![],
+        })
+        .collect();
+
+    // Append DeriveUnchecked entries as their own groups
+    for entry in cfg_attr_entries {
+        if let CfgAttrContent::DeriveUnchecked(ref unchecked) = entry.content {
+            groups.push(ConditionalDeriveGroup {
+                predicate: entry.predicate.clone(),
+                typed_traits: vec![],
+                unchecked_traits: unchecked.clone(),
+            });
+        }
+    }
+
+    groups
+}
+
+/// Represents a function that is used for custom sanitizers and validators specified
+/// with `with =`.
+/// It can be either pass to an existing function or a closure.
+#[derive(Debug, Clone)]
+pub enum CustomFunction {
+    Path(Path),
+    Closure(ExprClosure),
+}
+
+impl Parse for CustomFunction {
+    fn parse(input: ParseStream) -> syn::Result<CustomFunction> {
+        if let Ok(path) = input.parse::<Path>() {
+            Ok(Self::Path(path))
+        } else if let Ok(closure) = input.parse::<ExprClosure>() {
+            Ok(Self::Closure(closure))
+        } else {
+            let msg = "Expected a path to function or a closure.";
+            Err(syn::Error::new(input.span(), msg))
+        }
+    }
+}
+
+impl CustomFunction {
+    pub fn try_into_typed(self, inner_type: &syn::Type) -> syn::Result<TypedCustomFunction> {
+        match self {
+            CustomFunction::Path(path) => Ok(TypedCustomFunction::Path(path)),
+            CustomFunction::Closure(closure) => {
+                // NOTE: this is a bit hacky, we're converting things to TokenStream and back.
+                let input_token_stream = quote!(#closure);
+                let output_token_stream = type_custom_closure(&input_token_stream, inner_type);
+                let typed_closure: ExprClosure = syn::parse2(output_token_stream)?;
+                Ok(TypedCustomFunction::Closure(typed_closure))
+            }
+        }
+    }
+}
+
+impl ToTokens for CustomFunction {
+    fn to_tokens(&self, token_stream: &mut TokenStream) {
+        match self {
+            CustomFunction::Path(path) => {
+                path.to_tokens(token_stream);
+            }
+            CustomFunction::Closure(closure) => {
+                closure.to_tokens(token_stream);
+            }
+        };
+    }
+}
+
+/// Represents a function that is used for custom sanitizers and validators specified
+/// with `with =`.
+/// It's almost the same as CustomFunction with one important difference:
+/// TypedCustomFunction is guaranteed to have arguments in closure to be typed.
+/// While CustomFunction is used for parsing, TypedCustomFunction is used for code generation.
+#[derive(Debug, Clone)]
+pub enum TypedCustomFunction {
+    Path(Path),
+    Closure(ExprClosure),
+}
+
+impl ToTokens for TypedCustomFunction {
+    fn to_tokens(&self, token_stream: &mut TokenStream) {
+        match self {
+            Self::Path(path) => {
+                path.to_tokens(token_stream);
+            }
+            Self::Closure(closure) => {
+                closure.to_tokens(token_stream);
+            }
+        };
+    }
+}
+
+/// This trait allows to reuse validation of numeric validators. The associated
+/// `Bound` type is the inner value type of the bounds (e.g. `i32` for an integer
+/// newtype), which is a function of the validator type itself.
+pub trait NumericBoundValidator {
+    type Bound: Clone;
+    fn greater(&self) -> Option<Self::Bound>;
+    fn greater_or_equal(&self) -> Option<Self::Bound>;
+    fn less(&self) -> Option<Self::Bound>;
+    fn less_or_equal(&self) -> Option<Self::Bound>;
+}
+
+macro_rules! impl_numeric_bound_validator {
+    ($tp:ident) => {
+        impl<T: Clone> crate::common::models::NumericBoundValidator for $tp<T> {
+            type Bound = T;
+            fn greater(&self) -> Option<T> {
+                if let $tp::Greater(ValueOrExpr::Value(value)) = self {
+                    Some(value.clone())
+                } else {
+                    None
+                }
+            }
+
+            fn greater_or_equal(&self) -> Option<T> {
+                if let $tp::GreaterOrEqual(ValueOrExpr::Value(value)) = self {
+                    Some(value.clone())
+                } else {
+                    None
+                }
+            }
+
+            fn less(&self) -> Option<T> {
+                if let $tp::Less(ValueOrExpr::Value(value)) = self {
+                    Some(value.clone())
+                } else {
+                    None
+                }
+            }
+
+            fn less_or_equal(&self) -> Option<T> {
+                if let $tp::LessOrEqual(ValueOrExpr::Value(value)) = self {
+                    Some(value.clone())
+                } else {
+                    None
+                }
+            }
+        }
+    };
+}
+
+pub(crate) use impl_numeric_bound_validator;
+
+/// The trait is used to generate tests for integer and float types, to ensure that
+/// the upper boundary is not below the lower boundary.
+pub trait NumericBound {
+    fn upper(&self) -> Option<TokenStream>;
+    fn lower(&self) -> Option<TokenStream>;
+}
+
+macro_rules! impl_numeric_bound_on_vec_of {
+    ($validator:ident) => {
+        impl<T: ::quote::ToTokens> crate::common::models::NumericBound for Vec<$validator<T>> {
+            fn upper(&self) -> Option<TokenStream> {
+                use ::quote::ToTokens;
+
+                let values: Vec<TokenStream> = self
+                    .iter()
+                    .filter_map(|v| match v {
+                        $validator::LessOrEqual(v) => Some(v),
+                        $validator::Less(v) => Some(v),
+                        _ => None,
+                    })
+                    .map(|v| v.to_token_stream())
+                    .collect();
+
+                if values.len() > 1 {
+                    // This should actually never happened, since there are validation in place that
+                    // prevents usage of `less_or_equal` and `less` at the same time,
+                    // but we want to be sure.
+                    panic!("It's not allowed to use less_or_equal and less validators at the same time");
+                }
+
+                values.into_iter().next()
+            }
+
+            fn lower(&self) -> Option<TokenStream> {
+                use ::quote::ToTokens;
+
+                let values: Vec<TokenStream> = self
+                    .iter()
+                    .filter_map(|v| match v {
+                        $validator::GreaterOrEqual(v) => Some(v),
+                        $validator::Greater(v) => Some(v),
+                        _ => None,
+                    })
+                    .map(|v| v.to_token_stream())
+                    .collect();
+
+                if values.len() > 1 {
+                    // This should actually never happened, since there are validation in place that
+                    // prevents usage of `greater_or_equal` and `greater` at the same time,
+                    // but we want to be sure.
+                    panic!(
+                        "It's not allowed to use greater_or_equal and greater validators at the same time"
+                    );
+                }
+
+                values.into_iter().next()
+            }
+        }
+    }
+}
+
+pub(crate) use impl_numeric_bound_on_vec_of;
+
+/// Define the inner-type enum for a numeric kind (integer, float) together with
+/// its marker-trait impls, `ToTokens` and `Display`. Integer and float share
+/// the exact same shape, differing only in the enum name, the marker trait and
+/// the list of concrete types.
+macro_rules! define_numeric_inner_type {
+    ($enum_name:ident, $marker_trait:ident, $($tp:ty => $variant:ident),* $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum $enum_name {
+            $($variant),*
+        }
+
+        $(
+            impl $marker_trait for $tp {}
+        )*
+
+        impl ::quote::ToTokens for $enum_name {
+            fn to_tokens(&self, token_stream: &mut ::proc_macro2::TokenStream) {
+                let type_stream = match self {
+                    $(
+                        Self::$variant => ::quote::quote!($tp),
+                    )*
+                };
+                ::quote::ToTokens::to_tokens(&type_stream, token_stream);
+            }
+        }
+
+        impl ::core::fmt::Display for $enum_name {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                match self {
+                    $(
+                        Self::$variant => stringify!($tp).fmt(f),
+                    )*
+                }
+            }
+        }
+    };
+}
+
+pub(crate) use define_numeric_inner_type;

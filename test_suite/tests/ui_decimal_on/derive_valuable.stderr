@@ -1,0 +1,5 @@
+error: #[nutype] cannot derive `Valuable` trait for `rust_decimal::Decimal`, because it does not implement `valuable::Valuable`.
+ --> tests/ui_decimal_on/derive_valuable.rs:6:24
+  |
+6 | #[nutype(derive(Debug, Valuable))]
+  |                        ^^^^^^^^

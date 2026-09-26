@@ -1,0 +1,22 @@
+error[E0603]: struct import `Percentage` is private
+  --> tests/ui/integer/visibility/private.rs:13:19
+   |
+13 |     encapsulated::Percentage::new(144);
+   |                   ^^^^^^^^^^ private struct import
+   |
+note: the struct import `Percentage` is defined here...
+  --> tests/ui/integer/visibility/private.rs:4:5
+   |
+ 4 |     #[nutype(sanitize(with = |n: i32| n.clamp(0, 100)))]
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: ...and refers to the struct `Percentage` which is defined here
+  --> tests/ui/integer/visibility/private.rs:4:5
+   |
+ 4 |     #[nutype(sanitize(with = |n: i32| n.clamp(0, 100)))]
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ you could import this directly
+   = note: this error originates in the attribute macro `nutype` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: import `Percentage` directly
+   |
+13 -     encapsulated::Percentage::new(144);
+13 +     __nutype_Percentage__::Percentage(144);
+   |

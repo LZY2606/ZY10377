@@ -1,0 +1,11 @@
+error: Deriving `Arbitrary` for a Decimal type currently supports inclusive bounds only (`greater_or_equal` / `less_or_equal`).
+       Exclusive bounds (`greater` / `less`) are not yet supported, because nudging an exact Decimal strictly past a bound is unsolved here.
+ --> tests/ui_decimal_on_arbitrary/arbitrary_exclusive_bound.rs:6:1
+  |
+6 | / #[nutype(
+7 | |     validate(greater = 0),
+8 | |     derive(Debug, Arbitrary),
+9 | | )]
+  | |__^
+  |
+  = note: this error originates in the attribute macro `nutype` (in Nightly builds, run with -Z macro-backtrace for more info)

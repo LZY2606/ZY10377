@@ -1,0 +1,89 @@
+use core::fmt::Debug;
+use kinded::Kinded;
+use proc_macro2::TokenStream;
+use quote::ToTokens;
+use syn::Field;
+
+use crate::common::models::{CustomFunction, Guard, RawGuard, SpannedItem, TypeTrait};
+
+/// Sanitizer for "any" type.
+#[derive(Debug, Kinded)]
+#[kinded(display = "snake_case")]
+pub enum AnySanitizer {
+    With(CustomFunction),
+}
+
+pub type SpannedAnySanitizer = SpannedItem<AnySanitizer>;
+
+/// Validator for "any" type.
+#[derive(Debug, Kinded)]
+#[kinded(display = "snake_case")]
+pub enum AnyValidator {
+    Predicate(CustomFunction),
+}
+
+pub type SpannedAnyValidator = SpannedItem<AnyValidator>;
+
+// Note that the order in which the variants are declared here is the order
+// in which traits are derived and implemented in the generated code.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, PartialOrd, Ord)]
+pub enum AnyDeriveTrait {
+    // Standard
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Display,
+    AsRef,
+    Into,
+    From,
+    Deref,
+    Borrow,
+    FromStr,
+    TryFrom,
+    Default,
+    Hash,
+    IntoIterator,
+
+    // External crates
+    SerdeSerialize,
+    SerdeDeserialize,
+    ArbitraryArbitrary,
+    ValuableValuable,
+}
+
+impl TypeTrait for AnyDeriveTrait {
+    fn is_from_str(&self) -> bool {
+        self == &AnyDeriveTrait::FromStr
+    }
+    fn is_default(&self) -> bool {
+        self == &AnyDeriveTrait::Default
+    }
+    fn is_serde_serialize(&self) -> bool {
+        self == &AnyDeriveTrait::SerdeSerialize
+    }
+    fn is_serde_deserialize(&self) -> bool {
+        self == &AnyDeriveTrait::SerdeDeserialize
+    }
+}
+
+pub type AnyRawGuard = RawGuard<SpannedAnySanitizer, SpannedAnyValidator>;
+pub type AnyGuard = Guard<AnySanitizer, AnyValidator>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnyInnerType(Field);
+
+impl AnyInnerType {
+    pub fn new(field: Field) -> Self {
+        Self(field)
+    }
+}
+
+impl ToTokens for AnyInnerType {
+    fn to_tokens(&self, token_stream: &mut TokenStream) {
+        self.0.to_tokens(token_stream)
+    }
+}

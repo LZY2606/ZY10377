@@ -1,0 +1,31 @@
+[workspace]
+
+resolver = "2"
+
+members = [
+    "nutype",
+    "nutype_macros",
+    "test_suite",
+    "dummy",
+
+    # All examples except "no_std_example" are tested in the test suite
+    "examples/any_arbitrary",
+    "examples/derive_unchecked_example",
+    "examples/float_arbitrary",
+    "examples/float_sortable",
+    "examples/integer_arbitrary",
+    "examples/integer_bounded",
+    "examples/new_unchecked_example",
+    # "examples/no_std_example",
+    "examples/serde_complex",
+    "examples/string_bounded_len",
+    "examples/string_regex_email",
+    "examples/string_arbitrary",
+    "examples/any_generics",
+    "examples/custom_error",
+    "examples/const_example",
+    "examples/cfg_attr_example",
+    "examples/valuable_example",
+    "examples/str_reference",
+    "examples/decimal_percentage",
+]

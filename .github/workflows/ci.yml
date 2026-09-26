@@ -1,0 +1,171 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+jobs:
+  unit_tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: cargo test
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+
+      - name: cargo test --features serde
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --features serde
+
+      - name: cargo test --features regex
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --features regex
+
+      - name: cargo test --features new_unchecked
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --features new_unchecked
+
+      - name: cargo test --features arbitrary
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --features arbitrary
+
+      - name: cargo test --features schemars08
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --features schemars08
+
+      - name: cargo test --features valuable
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --features valuable
+
+      - name: cargo test --features rust_decimal
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --features rust_decimal
+
+      - name: cargo test --all-features
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --all-features
+
+  doctests:
+    name: Doctests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Run doctests for nutype
+        run: |
+          cd nutype
+          cargo test --doc --all-features
+
+      - name: Run doctests for nutype_macros
+        run: |
+          cd nutype_macros
+          cargo test --doc --all-features
+
+  rustfmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt
+
+      - name: Check formatting
+        uses: actions-rs/cargo@v1
+        with:
+          command: fmt
+          args: -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Clippy Check
+        uses: actions-rs/cargo@v1
+        with:
+          command: clippy
+          args: -- -D warnings
+
+  examples:
+    name: Examples
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: thumbv7m-none-eabi   # Needed for no_std_example
+
+      - name: Run examples
+        run: |
+          set -euxo pipefail
+          ROOT_DIR=$(pwd)
+          for EXAMPLE in `ls examples`; do
+            cd $ROOT_DIR/examples/$EXAMPLE;
+            if [[ "$EXAMPLE" == "no_std_example" ]]
+            then
+              cargo build
+            else
+              cargo run
+              cargo test
+            fi
+          done
+
+  typos:
+    name: Typos
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: typos-action
+        uses: crate-ci/typos@v1.17.0
